@@ -125,8 +125,8 @@ or decode the local video/audio selections using the same row partition before c
 delivery. Packed lengths must divide evenly by the Ulysses degree. TP and ring parallelism
 are intentionally outside this stage.
 
-The synthetic two-rank smoke check exercises prefix, plan, and denoise forwards with a
-two-head-per-rank cache and verifies finite local outputs. It is a communication and shape
+The synthetic two-rank smoke check exercises prefix, a one-token plan, and denoise forwards with a
+two-head-per-rank cache, a non-divisible 19-token prefix, and verifies finite local outputs. It is a communication and shape
 check; full H3 media generation remains a later session/codec stage.
 
 ## 4. Weights, verification and remaining limits
