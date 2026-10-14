@@ -12,6 +12,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all_packed_qkv,
+    _usp_output_all_to_all,
+)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
@@ -85,11 +89,12 @@ def h3_attention(
     rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
     cache: H3KVCache | None,
     layer_index: int,
+    use_ulysses: bool = True,
 ) -> torch.Tensor:
-    token_count = hidden_states.shape[0]
+    local_token_count = hidden_states.shape[0]
     projected, _ = attention.qkv_proj(hidden_states)
     q, k, v = (
-        tensor.reshape(token_count, attention.num_heads, attention.head_dim)
+        tensor.reshape(local_token_count, attention.num_heads, attention.head_dim)
         for tensor in projected.split(attention.local_inner_dim, dim=-1)
     )
     q, k = _apply_qk_norm(q, k, attention.q_norm, attention.k_norm, attention.head_dim)
@@ -97,6 +102,17 @@ def h3_attention(
         q, k = _apply_rope_qk(q, k, *rope_cache)
     else:
         pass
+    ulysses_size = get_ulysses_ctx()[0] if use_ulysses else 1
+    if ulysses_size > 1:
+        if local_token_count <= 0:
+            raise ValueError("Ulysses attention requires nonempty local rows")
+        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        local_head_count = q.shape[1]
+        if local_head_count * ulysses_size != attention.num_heads:
+            raise ValueError(
+                "Ulysses attention received an unexpected head shard: "
+                f"{local_head_count} * {ulysses_size} != {attention.num_heads}"
+            )
     if cache is not None:
         k, v = cache.update(layer_index, k.unsqueeze(0), v.unsqueeze(0))
     else:
@@ -108,17 +124,30 @@ def h3_attention(
         attn_mask=visibility,
         scale=attention.softmax_scale,
     )
-    output, _ = attention.out_proj(
-        attended.transpose(1, 2).reshape(token_count, attention.local_inner_dim)
-    )
+    if ulysses_size > 1:
+        attended = _usp_output_all_to_all(attended.transpose(1, 2), head_dim=2)
+        attended = attended.reshape(local_token_count, attention.local_inner_dim)
+    else:
+        attended = attended.transpose(1, 2).reshape(
+            local_token_count, attention.local_inner_dim
+        )
+    output, _ = attention.out_proj(attended)
     return output
 
 
 class CausalH3Model(nn.Module):
     def __init__(self, backbone: MiniMaxH3DiTModel, *, clean_timestep: float) -> None:
         super().__init__()
-        if (get_tp_world_size(), get_ulysses_ctx()[0], get_ring_ctx()[0]) != (1, 1, 1):
-            raise ValueError("The causal H3 adapter currently requires TP1 and SP1")
+        tp_size = get_tp_world_size()
+        ulysses_size, _ = get_ulysses_ctx()
+        ring_size, _ = get_ring_ctx()
+        if tp_size != 1 or ring_size != 1:
+            raise ValueError("The causal H3 adapter requires TP1 and ring degree 1")
+        elif backbone.arch.num_attention_heads % ulysses_size:
+            raise ValueError(
+                "H3 attention heads must divide evenly across Ulysses: "
+                f"{backbone.arch.num_attention_heads} % {ulysses_size} != 0"
+            )
         elif backbone.adaln_cache is not None or backbone.adaln_t_table is not None:
             raise ValueError("Causal H3 requires the original timestep projections")
         elif not 0 < clean_timestep <= 1:
@@ -165,6 +194,20 @@ class CausalH3Model(nn.Module):
         else:
             pass
 
+        ulysses_size, ulysses_rank = get_ulysses_ctx()
+        ring_size, _ = get_ring_ctx()
+        if ring_size != 1:
+            raise ValueError("Causal H3 does not support ring parallelism")
+        else:
+            total_token_count = sum(span.token_count for span in spans)
+            if total_token_count % ulysses_size:
+                raise ValueError(
+                    "The packed H3 sequence must divide evenly across Ulysses: "
+                    f"{total_token_count} % {ulysses_size} != 0"
+                )
+            row_start = ulysses_rank * (total_token_count // ulysses_size)
+            row_stop = row_start + total_token_count // ulysses_size
+
         refined_by_block: dict[tuple[str, int], torch.Tensor] = {}
         if sequence.refiner_segments:
             text_spans = tuple(segment.span for segment in sequence.refiner_segments)
@@ -181,6 +224,7 @@ class CausalH3Model(nn.Module):
                     rope_cache=None,
                     cache=None,
                     layer_index=0,
+                    use_ulysses=False,
                 )
                 text = text + block.mlp(block.norm2(text))
             text = backbone.token_refiner.final_norm(text)
@@ -230,9 +274,19 @@ class CausalH3Model(nn.Module):
         positions = torch.cat([segment.positions for segment in sequence.segments])[
             None
         ]
+        hidden_states = hidden_states[row_start:row_stop]
+        time_indices = time_indices[row_start:row_stop]
+        modality_tags = modality_tags[row_start:row_stop]
+        video_indices = [
+            index - row_start for index in video_indices if row_start <= index < row_stop
+        ]
+        audio_indices = [
+            index - row_start for index in audio_indices if row_start <= index < row_stop
+        ]
+        positions = positions[:, row_start:row_stop]
         rope_cache = (
             _rope_cos_sin_cache(backbone.rope(positions), dtype=torch.bfloat16),
-            torch.arange(cursor, device=device, dtype=torch.long),
+            torch.arange(row_stop - row_start, device=device, dtype=torch.long),
         )
         inverse_indices = torch.tensor(time_indices, device=device, dtype=torch.long)
         combined_indices = (

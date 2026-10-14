@@ -156,9 +156,24 @@ class H3KVCache:
             layer = self.layers[layer_index]
             token_count = sum(span.token_count for span in self.query_spans)
             expected_shape = (1, token_count, layer.k.shape[2], layer.k.shape[3])
-            assert key.shape == value.shape == expected_shape
-            assert key.dtype == value.dtype == layer.k.dtype
-            assert key.device == value.device == layer.k.device
+            if key.shape != value.shape or key.shape != expected_shape:
+                raise ValueError(
+                    "Cached H3 K/V must use the active Ulysses head shard: "
+                    f"expected {expected_shape}, got K={tuple(key.shape)}, "
+                    f"V={tuple(value.shape)}"
+                )
+            elif key.dtype != value.dtype or key.dtype != layer.k.dtype:
+                raise ValueError(
+                    "Cached H3 K/V dtype must match the allocated cache: "
+                    f"expected {layer.k.dtype}, got K={key.dtype}, V={value.dtype}"
+                )
+            elif key.device != value.device or key.device != layer.k.device:
+                raise ValueError(
+                    "Cached H3 K/V device must match the allocated cache: "
+                    f"expected {layer.k.device}, got K={key.device}, V={value.device}"
+                )
+            else:
+                pass
             prefix_length = self.committed_token_count
             if self.phase == "plan":
                 self.plan_keys[layer_index, :, :token_count].copy_(key)
