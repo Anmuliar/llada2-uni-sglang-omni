@@ -122,12 +122,14 @@ inverse collective returns `[S_local, H, D]` for the residual and output project
 The token refiner remains replicated because it is a short text-only computation. The
 returned `H3Output` contains this rank's local row selection; a serving stage must gather
 or decode the local video/audio selections using the same row partition before client
-delivery. Packed lengths must divide evenly by the Ulysses degree. TP and ring parallelism
-are intentionally outside this stage.
+delivery. Packed rows are padded only for the sequence-to-head collective when the logical
+length is not divisible by the Ulysses degree; padding is removed before cache writes and
+output selection. TP and ring parallelism are intentionally outside this stage.
 
-The synthetic two-rank smoke check exercises prefix, plan, and denoise forwards with a
-two-head-per-rank cache and verifies finite local outputs. It is a communication and shape
-check; full H3 media generation remains a later session/codec stage.
+The synthetic two-rank smoke check exercises prefix, a one-token plan, and denoise forwards
+with a two-head-per-rank cache, a non-divisible 19-token prefix, and verifies finite local
+outputs. It is a communication and shape check; full H3 media generation remains a later
+session/codec stage.
 
 ## 4. Weights, verification and remaining limits
 

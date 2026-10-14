@@ -113,6 +113,11 @@ def h3_attention(
                 "Ulysses attention received an unexpected head shard: "
                 f"{local_head_count} * {ulysses_size} != {attention.num_heads}"
             )
+        else:
+            valid_token_count = visibility.shape[-2]
+            q, k, v = (tensor[:valid_token_count] for tensor in (q, k, v))
+    else:
+        pass
     if cache is not None:
         k, v = cache.update(layer_index, k.unsqueeze(0), v.unsqueeze(0))
     else:
@@ -125,7 +130,9 @@ def h3_attention(
         scale=attention.softmax_scale,
     )
     if ulysses_size > 1:
-        attended = _usp_output_all_to_all(attended.transpose(1, 2), head_dim=2)
+        padding_tokens = local_token_count * ulysses_size - visibility.shape[-2]
+        attended = F.pad(attended.transpose(1, 2), (0, 0, 0, 0, 0, padding_tokens))
+        attended = _usp_output_all_to_all(attended, head_dim=2)
         attended = attended.reshape(local_token_count, attention.local_inner_dim)
     else:
         attended = attended.transpose(1, 2).reshape(
@@ -200,13 +207,10 @@ class CausalH3Model(nn.Module):
             raise ValueError("Causal H3 does not support ring parallelism")
         else:
             total_token_count = sum(span.token_count for span in spans)
-            if total_token_count % ulysses_size:
-                raise ValueError(
-                    "The packed H3 sequence must divide evenly across Ulysses: "
-                    f"{total_token_count} % {ulysses_size} != 0"
-                )
-            row_start = ulysses_rank * (total_token_count // ulysses_size)
-            row_stop = row_start + total_token_count // ulysses_size
+            padding_tokens = -total_token_count % ulysses_size
+            local_token_count = (total_token_count + padding_tokens) // ulysses_size
+            row_start = ulysses_rank * local_token_count
+            row_stop = row_start + local_token_count
 
         refined_by_block: dict[tuple[str, int], torch.Tensor] = {}
         if sequence.refiner_segments:
@@ -274,6 +278,10 @@ class CausalH3Model(nn.Module):
         positions = torch.cat([segment.positions for segment in sequence.segments])[
             None
         ]
+        hidden_states = F.pad(hidden_states, (0, 0, 0, padding_tokens))
+        positions = F.pad(positions, (0, 0, 0, padding_tokens))
+        time_indices.extend([0] * padding_tokens)
+        modality_tags.extend([0] * padding_tokens)
         hidden_states = hidden_states[row_start:row_stop]
         time_indices = time_indices[row_start:row_stop]
         modality_tags = modality_tags[row_start:row_stop]
