@@ -11,7 +11,7 @@ come from SGLang-Diffusion; Qwen sessions will use Omni's existing AR session br
 | Layout and visibility | H3-specific spans and masks in Omni | Implemented; real Qwen sequence export pending |
 | Persistent DiT K/V | Diffusion `CausalSelfAttentionKVCache` plus H3 commit lifecycle | Implemented |
 | Native H3 forward | Diffusion projections, refiner, AdaLN, RoPE, transformer and output layers | Implemented at TP1/SP1; checkpoint-backed reuse versus history rebuild verified |
-| H3 Ulysses | Existing Diffusion sequence/head all-to-all | Next stage; adapter explicitly rejects TP/SP greater than one |
+| H3 Ulysses | Existing Diffusion sequence/head all-to-all | Implemented for TP1/Ulysses; ring and TP remain rejected |
 | Session and codec | Omni session scheduler/hooks and existing audio/video VAEs | Planned |
 | Online Qwen | Omni `ARSessionBridge` and SGLang AR cache | Planned; Qwen and DiT retain separate physical pools |
 | Overlap and client | Bounded planner(k+1), DiT(k), decoder(k-1) execution | Planned; demonstration client deferred |
@@ -106,9 +106,28 @@ Admission rejects out-of-order blocks and capacity overflow. Growth/eviction are
 Changing reference/shared content, positions, checkpoint or historical plans requires reset
 and replay. There is no unified physical Qwen/DiT pool.
 
-The next Ulysses stage will place sequence-to-head all-to-all after projection/norm/RoPE,
-then update cache and run attention, followed by inverse all-to-all. Each rank will retain
-full history for its local heads. No multi-rank behavior is claimed by the current adapter.
+The Ulysses path places sequence-to-head all-to-all after projection/norm/RoPE, then updates
+the cache and runs attention, followed by inverse all-to-all. Each rank retains full history
+for its local heads; the serving boundary still owns output gathering.
+
+### Stage 3: Ulysses attention boundary
+
+The causal adapter now reuses Diffusion's `_usp_input_all_to_all_packed_qkv` and
+`_usp_output_all_to_all` helpers. Before attention, each rank owns a contiguous row shard;
+the input collective changes `[S_local, H, D]` into `[S, H/U, D]`. The cache is therefore
+allocated with `H/U` heads per layer, while its token axis still contains the full logical
+prefix, plan, and current-media rows. Attention uses the full visibility mask, and the
+inverse collective returns `[S_local, H, D]` for the residual and output projections.
+
+The token refiner remains replicated because it is a short text-only computation. The
+returned `H3Output` contains this rank's local row selection; a serving stage must gather
+or decode the local video/audio selections using the same row partition before client
+delivery. Packed lengths must divide evenly by the Ulysses degree. TP and ring parallelism
+are intentionally outside this stage.
+
+The synthetic two-rank smoke check exercises prefix, plan, and denoise forwards with a
+two-head-per-rank cache and verifies finite local outputs. It is a communication and shape
+check; full H3 media generation remains a later session/codec stage.
 
 ## 4. Weights, verification and remaining limits
 
