@@ -1,37 +1,37 @@
 # Causal H3 duplex integration
 
-This branch starts with the token-visibility and persistent-K/V boundary. It does not yet
-register a runnable H3 serving pipeline. It reuses SGLang-Diffusion's causal attention
-storage; Qwen sessions will continue to use the existing SGLang AR session bridge.
+This branch implements the single-session H3 token layout, persistent K/V, and a native
+H3 forward adapter. It does not yet register a serving pipeline. Generation components
+come from SGLang-Diffusion; Qwen sessions will use Omni's existing AR session bridge.
 
 ## 1. Component ownership and implementation stages
 
 | Stage | Owner and reuse | State on this branch |
 | --- | --- | --- |
-| Layout and visibility | H3-specific adapter in Omni; existing model projections and RoPE stay in Diffusion | Span contracts and dense correctness mask implemented; checkpoint-backed sequence exporter pending |
-| Persistent DiT K/V | Diffusion `CausalSelfAttentionKVCache` plus H3 commit lifecycle | Implemented and tested with a synthetic multilayer attention stack; actual H3 forward integration pending |
-| H3 Ulysses | Existing Diffusion sequence/head all-to-all | Planned; no TP, FSDP or distributed verification claimed |
-| Session and codec | Omni `SessionScheduler`/`SessionHooks`, existing audio/video VAEs | Planned |
-| Online Qwen | Omni `ARSessionBridge` and SGLang's AR cache | Planned; Qwen and DiT retain separate physical pools |
-| Overlap and client | Bounded planner(k+1), DiT(k), decoder(k-1) execution | Planned; duplex demonstration client deferred |
+| Layout and visibility | H3-specific spans and masks in Omni | Implemented; real Qwen sequence export pending |
+| Persistent DiT K/V | Diffusion `CausalSelfAttentionKVCache` plus H3 commit lifecycle | Implemented |
+| Native H3 forward | Diffusion projections, refiner, AdaLN, RoPE, transformer and output layers | Implemented at TP1/SP1; checkpoint-backed reuse versus history rebuild verified |
+| H3 Ulysses | Existing Diffusion sequence/head all-to-all | Next stage; adapter explicitly rejects TP/SP greater than one |
+| Session and codec | Omni session scheduler/hooks and existing audio/video VAEs | Planned |
+| Online Qwen | Omni `ARSessionBridge` and SGLang AR cache | Planned; Qwen and DiT retain separate physical pools |
+| Overlap and client | Bounded planner(k+1), DiT(k), decoder(k-1) execution | Planned; demonstration client deferred |
 
 No framework-wide allocator, RadixCache replacement, sparse attention, eviction policy,
-or model registry entry is added before the checkpoint-backed model path is validated.
+or model registry entry is introduced. The model integration owns the causal policy;
+it does not replace process-global attention classes.
 
 ## 2. Physical rows and visibility
 
-For single-session full recomputation through block k, without padding:
+Single-session full recomputation through block k, without padding:
 
 ```text
 [reference][shared H50][clean V0 A0 ... clean V(k-1) A(k-1)]
 [plan0 ... plank][noisy Vk Ak]
 ```
 
-`replay_spans` describes these ranges; it does not manufacture H50, latent tensors, or
-position coordinates. Each AV range contains video followed by audio. With reference=120,
-shared=128, V=120, A=14, and plan lengths 32/17/41, block 2 has 740 full-replay rows.
-Only 691 keys are visible to its 134 media query rows. Text lengths are illustrative,
-not a fixed Qwen output contract.
+Each media range contains video followed by audio. With reference=120, shared=128,
+V=120, A=14 and plan lengths 32/17/41, block 2 has 740 full-replay rows.
+Its 134 media query rows see 691 keys. Text lengths are examples, not a Qwen contract.
 
 | Query rows | Visible keys |
 | --- | --- |
@@ -42,69 +42,139 @@ not a fixed Qwen output contract.
 | Clean AV k | Reference, shared, clean AV through k, plan k |
 | Padding | Padding only |
 
-The token refiner has a different mask: shared rows see shared rows; each plan sees shared
-rows and its own plan. Before splitting plan prefill from media denoising, the adapter must
-preserve this refinement, the model's modality/time embeddings, roles, and absolute RoPE
-coordinates. Physical offsets are not RoPE coordinates.
+The refiner uses a separate mask: shared sees shared; each plan sees shared and itself.
+`H3Sequence` supplies query segments and refiner text segments separately. Plan prefill
+therefore passes only the plan as DiT queries, but passes shared plus that plan through
+the two refiner layers. Media forwards do not rerun the refiner.
 
-## 3. Cache lifecycle and parallel boundary
+Each `H3Segment` supplies:
 
-Each session owns one `H3KVCache` per Ulysses rank. Every layer has a fixed-capacity
-`CausalSelfAttentionKVCache` containing `[committed prefix | media working region]`.
-The current plan uses separate per-layer tensors. Storage is `[1, tokens, local heads,
-head dimension]`, with post-normalization, post-RoPE K and projected V.
+| Field | Native checkpoint shape/meaning |
+| --- | --- |
+| tokens | Video [N,96], audio [N,32], or H50 text [N,5120] |
+| positions | [N,3] absolute RoPE coordinates, preserved across replay and cache |
+| roles | [N] speaker role IDs; -1 disables the role embedding |
+| span | Reference/shared/plan/clean/noisy kind and block identity |
+| modality | Video=0, text=1, audio=2 |
+
+These are already patchified latents and encoder hidden states, not encoded media files.
+Projections map them to width 5376; the main transformer has 50 layers, 56 attention heads
+and head dimension 128. The adapter preserves native mixed FP32/BF16 operations, role
+embeddings, two text-refiner layers, modality/time AdaLN and output heads. Attention uses
+Torch SDPA with explicit visibility. Physical offsets are never substituted for RoPE
+coordinates. A production input exporter and padding/batching support are not implemented.
+
+The visibility contract follows the reference mask version `duplex_assistant_av_v5`.
+The pinned reference revision used for this integration is
+`4fb5376661eaf44a9a270f08880458c6d78d55bb`, in its attention predicates, sequence
+builder, model wrapper and native checkpoint loader.
+
+## 3. KV lifecycle and parallel boundary
+
+Each session owns an `H3KVCache`. Every layer uses Diffusion storage for
+`[committed prefix | media working region]`, plus separate current-plan tensors.
+Storage is [1, tokens, local heads, head dimension]: normalized, post-RoPE K and projected V.
 
 ```text
-begin_prefix -> prefix forward -> finish_forward
-begin_block(k) -> plan forward -> finish_forward
-              -> denoise forward -> finish_forward  (repeat for sampler steps)
-              -> clean forward -> finish_forward    (publish AV k)
+begin_prefix -> model(reference, shared)
+begin_block(k)
+  begin_forward(plan)    -> model(plan; refiner input = shared + plan)
+  begin_forward(denoise) -> model(noisy Vk, Ak)    repeat for sampler steps
+  begin_forward(clean)   -> model(final Vk, Ak)    publish history
 ```
 
-The underlying Diffusion write cursor includes temporary media, as in its causal video
-usage. `committed_token_count` is deliberately separate: denoising overwrites temporary
-rows without publishing history. Only a successful clean forward through every layer
-advances this boundary. History never includes old plan rows; their effect is already
-incorporated into the committed per-layer media K/V.
+The model calls `finish_forward` only after all layers and output projections succeed.
+A failure resets the session, including previously committed history. Cancellation between
+forwards must also reset or discard the session; there is no rollback guarantee.
 
-For the reference clean-time convention, plan/static/clean forwards use the fixed clean
-time (0.999), while only noisy media uses the current sampler time. The caller must
-provide the final scheduler-updated latent to the clean forward, not the last noisy
-input. The cache cannot infer noise level from a tensor. Its `clean` phase names this
-caller contract rather than validating checkpoint semantics.
+The underlying Diffusion write cursor includes temporary media.
+`committed_token_count` is separate: denoising overwrites working rows without publishing
+history. A clean forward at fixed timestep 0.999 commits the final scheduler-updated latent,
+not the last noisy input. Static/shared/plan/clean tokens all use the fixed clean timestep;
+only noisy media uses the current sampler timestep. The adapter returns velocities;
+sampler integration remains with the future generation stage.
 
-Queries for plan prefill use `[prefix | plan]` keys; media queries use
-`[prefix | current plan | current media]`. Concatenating these views currently copies
-keys/values: this is a correctness implementation, not a fused or zero-copy kernel.
-The dense mask is likewise a baseline, not a long-context optimization.
+Historical plan rows are not retained in committed storage. Their effects are incorporated
+into clean media K/V. Current plan K/V stays unchanged throughout the block's denoising.
 
-The intended Ulysses boundary is projections/norm/RoPE, sequence-to-head all-to-all,
-cache update and attention, inverse all-to-all. Each rank stores full history for its
-local heads. This branch accepts local head dimensions but does not yet wire collectives.
+Plan prefill attends [prefix | plan]; media attends [prefix | current plan | current media].
+The current concatenation copies K/V and the dense mask is quadratic. These are correctness
+baselines, not zero-copy or long-context optimizations. Shared text is refined again when
+prefilling each new plan; refiner K/V reuse is not yet implemented.
 
-Admission rejects out-of-order blocks and capacity overflow before model execution.
-Eviction and growth are disabled. Partial forwards cannot be committed; failure or
-cancellation requires `reset`, or discarding the session. Reset invalidates cursors
-without freeing allocation. The owner releases tensors on session close. Changes to
-reference, shared conditioning, positions, checkpoint, or historical plans require
-reset/replay. Fixed timestep and causal visibility are prerequisites for reuse.
+Admission rejects out-of-order blocks and capacity overflow. Growth/eviction are disabled.
+Changing reference/shared content, positions, checkpoint or historical plans requires reset
+and replay. There is no unified physical Qwen/DiT pool.
 
-## 4. Validation and remaining dependencies
+The next Ulysses stage will place sequence-to-head all-to-all after projection/norm/RoPE,
+then update cache and run attention, followed by inverse all-to-all. Each rank will retain
+full history for its local heads. No multi-rank behavior is claimed by the current adapter.
 
-Run:
+## 4. Weights, verification and remaining limits
+
+`load_causal_h3` consumes the native FL2VA transformer directory, streaming preview LoRA
+and complete duplex trainables. It checks shard coverage, tensor keys/shapes and rank-128
+adapter pairs. Released grouped QKV weights are reordered before applying runtime-layout
+LoRA deltas. Trainables replace the preview adapter; the two adapters are not added together.
+The preview file supplies the expected adapter schema. The loader fuses 266 A/B pairs with
+alpha/rank=128/128 and loads the trained role embedding and RoPE frequencies.
+
+Fusion uses FP32 accumulation followed by the native parameter dtype. This is not a claim
+of bitwise equivalence to the reference PEFT implementation's unfused GEMMs.
+
+The available checkpoint set used on 2026-10-14 was:
+
+```text
+/dllab/share/user/models/duplex_models/
+  MiniMax-H3/FL2VA/transformer/         535 base tensors, all 13 shards present
+  minimax_h3_raven_streaming_lora_4nfe_preview.safetensors
+  trainables.safetensors              532 LoRA tensors + role embedding + RoPE
+```
+
+Run the CPU/CUDA cache and small native-model tests:
 
 ```bash
-python -m pytest tests/unit_test/duplex_h3 -q
+PYTHONPATH=. EP_SUPPRESS_NCCL_CHECK=1 python -m pytest tests/unit_test/duplex_h3 -q
 ```
 
-The suite uses the actual Diffusion cache class. A deterministic three-layer attention
-stack compares full recomputation with cached execution over three blocks, varying plan
-and media lengths, three independent noisy inputs per block, and separate clean commits.
-CPU and CUDA paths are exercised when CUDA is available. The suite also checks the
-refiner mask, invalid ordering, capacity exhaustion, partial-forward failure and reset.
+Run the full-weight, identical-row-shape history rebuild comparison:
 
-These checks do not establish actual H3 output parity, checkpoint loading, real Ulysses
-collectives, Qwen append behavior, VAE continuity, throughput, or end-to-end streaming.
-The next step needs complete H3 base weights, streaming LoRA, the matching Qwen planner
-adapter, and duplex DiT trainables, plus a compatible input fixture. Whisper is needed
-only when enabling the closed-loop ASR input path.
+```bash
+PYTHONPATH=. EP_SUPPRESS_NCCL_CHECK=1 \
+H3_WEIGHTS_DIRECTORY=/dllab/share/user/models/duplex_models \
+python -m pytest tests/unit_test/duplex_h3/test_model.py -q -s \
+  -k 'rebuild or failure' --log-cli-level=INFO
+```
+
+The fixture uses deterministic synthetic latent/H50 tensors with reference=120, shared=8,
+two plans of length 4/6, and 120 video plus 14 audio tokens per block. Each block runs at
+noisy times 0.15 and 0.75, followed by a separate clean input at 0.999. It checks both output
+modalities, every committed layer's K/V, unchanged plan K/V, and failure after layer writes
+but before output completion. This is a forward/cache test, not a sampler-generated video.
+
+Measured on one H20-3e with Python 3.12 and Torch 2.13.0+cu130, importing H3 from
+`/root/sglang-v0.5.21/python/sglang`:
+
+- The default suite passed 16 tests; the full-weight rebuild/failure run passed two
+  tests with the packed comparison explicitly deselected.
+- The complete checkpoint loaded successfully.
+- Full-weight persistent reuse versus fresh history rebuild passed with bitwise-identical
+  video/audio outputs and committed K/V across both blocks.
+- The small native-model packed-replay comparison passed.
+- The full-weight packed-replay comparison did **not** pass its 2% relative-RMS threshold:
+  the first video case measured 9.77%. To reproduce, use the full-weight command with
+  `-k packed` instead. This diagnostic remains enabled; it has not been weakened to pass.
+
+A layer trace located the first mismatch before cache attention: layer-0 QKV projection
+inputs were bitwise equal, but different GEMM row counts produced BF16 output differences.
+In a controlled precision trace, 151 plan elements and 4,882 media elements differed by
+at most 0.0625 and 0.125 respectively; prefix projections were equal. Those differences
+amplified through the trained network. Disabling TF32/reduced-precision reduction and
+forcing math SDPA did not eliminate the issue. The rebuild comparison keeps row shapes
+identical to isolate persistence from this numerical change.
+
+Therefore checkpoint-backed KV persistence is verified, while packed-versus-split numerical
+equivalence remains unresolved. Real exported conditioning, reference-runtime parity,
+sampler trajectories, Qwen append behavior, codec continuity, Ulysses, throughput and
+end-to-end duplex streaming are not validated. No quality or speedup claim follows from
+these tests.
