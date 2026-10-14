@@ -1,8 +1,10 @@
 # Causal H3 duplex integration
 
-This branch implements the single-session H3 token layout, persistent K/V, and a native
-H3 forward adapter. It does not yet register a serving pipeline. Generation components
-come from SGLang-Diffusion; Qwen sessions will use Omni's existing AR session bridge.
+This branch implements the single-session H3 token layout, persistent K/V, a native
+H3 forward adapter, and the first session-level streaming path. Generation components
+come from SGLang-Diffusion; Qwen H50 state and H3 DiT state remain separate. The
+current pipeline is an integration scaffold: it validates session lifecycle and latent
+transport, while the production Qwen model adapter and codec wiring remain separate work.
 
 ## 1. Component ownership and implementation stages
 
@@ -12,9 +14,9 @@ come from SGLang-Diffusion; Qwen sessions will use Omni's existing AR session br
 | Persistent DiT K/V | Diffusion `CausalSelfAttentionKVCache` plus H3 commit lifecycle | Implemented |
 | Native H3 forward | Diffusion projections, refiner, AdaLN, RoPE, transformer and output layers | Implemented at TP1/SP1; checkpoint-backed reuse versus history rebuild verified |
 | H3 Ulysses | Existing Diffusion sequence/head all-to-all | Implemented for TP1/Ulysses; ring and TP remain rejected |
-| Session and codec | Omni session scheduler/hooks and existing audio/video VAEs | Planned |
-| Online Qwen | Omni `ARSessionBridge` and SGLang AR cache | Planned; Qwen and DiT retain separate physical pools |
-| Overlap and client | Bounded planner(k+1), DiT(k), decoder(k-1) execution | Planned; demonstration client deferred |
+| Session and codec | Omni session scheduler/hooks and existing audio/video VAEs | Session hook and latent output implemented; VAE decoder injection remains |
+| Online Qwen | Omni `ARSessionBridge` and SGLang AR cache | H50/Qwen state hook implemented; model adapter remains |
+| Overlap and client | Bounded planner(k+1), DiT(k), decoder(k-1) execution | Ordered bounded executor implemented; live coordinator/client deferred |
 
 No framework-wide allocator, RadixCache replacement, sparse attention, eviction policy,
 or model registry entry is introduced. The model integration owns the causal policy;
@@ -197,3 +199,75 @@ equivalence remains unresolved. Real exported conditioning, reference-runtime pa
 sampler trajectories, Qwen append behavior, codec continuity, Ulysses, throughput and
 end-to-end duplex streaming are not validated. No quality or speedup claim follows from
 these tests.
+
+
+## 5. Stage 4: H3 session and latent streaming
+
+`H3SessionHooks` is the session boundary for one causal H3 stream. The first
+`h3_block` payload must contain the immutable `reference` and `shared` segments.
+The hook runs their prefix forward once and creates one `H3KVCache` for the session.
+Each subsequent payload has this shape:
+
+```text
+h3_block {
+  block_index: k,
+  plan: H3Segment,
+  video: H3Segment,
+  audio: H3Segment | None,
+  reference/shared: present only on block 0,
+  eos: bool,
+}
+```
+
+For block k, the hook runs a plan prefill, then the configured denoising forwards on
+working video/audio rows. Those forwards overwrite the working region and do not publish
+history. An Euler update is used as the stage scaffold; a production scheduler can
+replace the update while retaining the same cache lifecycle. The final clean forward
+writes the updated media K/V into the committed prefix, then emits an `h3_latent` chunk
+containing `video_latent`, `audio_latent`, and the block index. If a decoder callback is
+provided, the same boundary emits separate video and audio chunks instead.
+
+The hook checks cancellation between forwards, rejects out-of-order blocks, and reports
+committed K/V tokens and allocated bytes through `ResourceUsage`. It currently expects
+already patchified `H3Segment` objects, so an encoder/Qwen exporter still has to construct
+positions, roles, modality, and visibility spans before entering this stage.
+
+## 6. Stage 5: Qwen H50 state and cache boundary
+
+`QwenH50SessionHooks` keeps the Qwen side independent from the DiT cache. A session may
+append one `shared` H50 segment followed by monotonic `plan` segments. Each payload may
+also carry per-layer Qwen K/V tuples; the hook validates layer and shape consistency and
+appends the token axis to `QwenKVState`. It returns a small stage payload containing the
+H50 tensor and block identity, while `usage()` reports Qwen K/V tokens and bytes.
+
+This stage intentionally does not load Qwen weights or infer H50 tokens. The missing
+adapter is responsible for calling the existing Qwen/AR model, deciding whether an input
+is shared or a new plan, and merging the returned H50 tensor with the H3 block exporter.
+Qwen K/V and DiT K/V therefore have separate lifetimes and physical storage. No global
+RadixCache replacement or unified allocator is introduced.
+
+## 7. Stage 6: bounded overlap scaffold
+
+`DuplexOverlapExecutor` models the intended steady-state schedule: Qwen for block k+1,
+H3 denoising for block k, and decoding for block k-1. It accepts a bounded number of
+in-flight `StagePayload`s, records per-stage wall time, and publishes `TimedChunk`s in
+block order even when later work finishes first. The bounded window provides backpressure
+and prevents unbounded latent/cache growth.
+
+The executor is deliberately a small coordinator primitive, separate from the session
+hooks. It is not yet connected to a multi-process Omni coordinator, CUDA stream policy,
+or a demonstration client. It also does not claim overlap between model kernels: the
+callers must place Qwen, DiT, and decoder work on appropriate workers/streams and must
+ensure that each session's mutable cache is not concurrently advanced by two blocks.
+
+## 8. Stage 4–6 validation and limits
+
+The focused stage tests cover H50 shared/plan append and Qwen K/V concatenation, H50 to
+H3 position construction, and bounded ordered overlap. A tiny CUDA H3 session was also
+run with two blocks and two denoising steps; each block emitted finite video/audio latent
+shapes `(13, 96)` and `(4, 32)`, while committed K/V grew from 36 to 53 tokens.
+
+These checks establish the lifecycle and tensor contracts only. They do not validate
+Qwen-generated H50 quality, VAE decode continuity, a real microphone/camera client,
+quality under long Raven continuation, or end-to-end throughput. The full-weight
+checkpoint-backed cache and native forward limits in the earlier sections still apply.
