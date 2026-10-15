@@ -87,13 +87,20 @@ class H3SessionHooks(SessionHooks):
         *,
         capacity_tokens: int,
         plan_capacity_tokens: int,
-        denoise_timesteps: tuple[float, ...] = (0.9, 0.5, 0.1),
+        denoise_timesteps: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75),
         decoder: H3LatentDecoder | None = None,
     ) -> None:
         if not denoise_timesteps or any(
-            timestep <= 0 or timestep >= 1 for timestep in denoise_timesteps
+            timestep < 0 or timestep >= 1 for timestep in denoise_timesteps
         ):
-            raise ValueError("Denoise timesteps must be in (0, 1)")
+            raise ValueError("Denoise timesteps must be in [0, 1)")
+        else:
+            pass
+        if denoise_timesteps[0] != 0 or any(
+            right <= left
+            for left, right in zip(denoise_timesteps, denoise_timesteps[1:])
+        ):
+            raise ValueError("H3 timesteps must increase from noise=0 toward clean=1")
         else:
             pass
         self.model = model
@@ -180,11 +187,11 @@ class H3SessionHooks(SessionHooks):
             noisy_timestep=self.model.clean_timestep,
             cache=state.cache,
         )
-        video_tokens = video.tokens.clone()
-        audio_tokens = None if audio is None else audio.tokens.clone()
+        video_tokens = video.tokens.float().clone()
+        audio_tokens = None if audio is None else audio.tokens.float().clone()
         for timestep, next_timestep in zip(
             self.denoise_timesteps,
-            (*self.denoise_timesteps[1:], 0.0),
+            (*self.denoise_timesteps[1:], 1.0),
             strict=True,
         ):
             if context.cancelled.is_set():
@@ -223,9 +230,11 @@ class H3SessionHooks(SessionHooks):
                 cache=state.cache,
             )
             delta = next_timestep - timestep
-            video_tokens = video_tokens + output.video * delta
+            video_tokens = video_tokens + output.video.float() * delta
             if audio_tokens is not None:
-                audio_tokens = audio_tokens + output.audio * delta
+                audio_tokens = audio_tokens + output.audio.float() * delta
+            else:
+                pass
         clean_video = H3Segment(
             span=AttentionSpan(
                 kind="clean",

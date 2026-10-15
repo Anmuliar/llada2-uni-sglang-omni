@@ -32,7 +32,7 @@ def create_h3_session_executor(
     clean_timestep: float = 0.999,
     capacity_tokens: int = 16_384,
     plan_capacity_tokens: int = 512,
-    denoise_timesteps: tuple[float, ...] = (0.9, 0.5, 0.1),
+    denoise_timesteps: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75),
     max_open_sessions: int = 2,
     device: str | None = None,
     gpu_id: int | None = None,
