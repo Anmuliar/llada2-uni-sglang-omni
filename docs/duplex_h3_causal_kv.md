@@ -271,3 +271,60 @@ These checks establish the lifecycle and tensor contracts only. They do not vali
 Qwen-generated H50 quality, VAE decode continuity, a real microphone/camera client,
 quality under long Raven continuation, or end-to-end throughput. The full-weight
 checkpoint-backed cache and native forward limits in the earlier sections still apply.
+
+## Offline generation validation
+
+The native adapters now support checkpoint-backed Qwen H50 extraction with a persistent
+Transformers cache, reference-image encoding, and bounded-window video/audio VAE decoding.
+The H3 session Euler solver advances from noise at t=0 to clean data at t=1; its default
+four evaluations are at 0, 0.25, 0.5, and 0.75. Reference/history cache writes still use
+clean_timestep=0.999. The previous descending schedule was incorrect for this checkpoint.
+Sampler state and velocity accumulation use float32.
+
+QwenH50Runner consumes cumulative token IDs with only the new video patches. It validates
+that the cached token prefix is unchanged, forwards only the new suffix, captures layer
+index 49, and returns newly selected H50 rows. It uses the Transformers cache directly;
+it does not copy that cache into QwenKVState or SGLang RadixCache. History revision requires
+closing and rebuilding the Qwen session. H3Codecs uses the native Diffusion VAEs, retaining
+the last four decoded frames from a three-latent temporal window. Its caller must initialize
+the Diffusion distributed environment and server arguments before loading the codecs.
+
+An offline evaluation on H20 used real user video, an assistant reference frame, the Qwen
+adapter, and the complete duplex trainables snapshot fused into the native H3 backbone.
+The preview LoRA file validates the adapter schema; its weights are not added a second time
+on top of the complete trained snapshot. Input coordinates follow the reference data builder:
+shared text has time -1 and zero spatial coordinates; plan k has time start_ms*0.04 and
+zero spatial coordinates; media has role 1 and absolute temporal/spatial RoPE coordinates.
+At 320x384, each block has 120 video rows and 14 audio rows. The evaluated shared prefix
+has 158 H50 rows; plan lengths come from Qwen rather than a fixed token count.
+
+| Evaluation | Media | H3 session wall | Result |
+| --- | --- | --- | --- |
+| Persistent KV, 4 steps | 4 s / 96 frames | 10.43 s | Increasing exposure/color distortion |
+| Persistent KV, 50 steps | 4 s / 96 frames | 91.17 s | Texture and identity degradation |
+| Persistent KV, 4 steps, user ASR input | 6 s / 144 frames | 17.00 s | Increasing color distortion; quality failed |
+
+These times exclude Qwen planning, reference encoding, media decode, and file output; they
+are not endpoint throughput measurements. The six-second case used offline Whisper word
+timestamps for the user speech. Qwen produced a nonempty plan, but generated-audio ASR did
+not recover that planned sentence. ASR is a diagnostic proxy, not a listening assessment.
+
+The four-second full-recomputation control also degraded. Its normalized pixel MAE across
+block boundaries was 0.08380, versus 0.08331 with persistent KV; within-block MAE was 0.02571
+and 0.02534 respectively. These statistics do not establish perceptual equivalence. Same-input
+cached-versus-packed velocity relative RMSE reached 5.96% for video and 9.27% for audio,
+so packed/split numerical parity remains unresolved. This is a control within the native
+adapter, not a fresh execution of the independent reference runtime.
+
+The six-second run appended Qwen KV to 1,399 tokens and H3 committed KV to 5,102 tokens.
+Qwen selected-H50 relative RMSE versus a full forward was 1.11%. All generated latents were
+finite, which did not prevent visible collapse. The CUDA/contract suite passes 20 tests,
+including the new solver regression. Full pre-commit initialization was blocked by the
+server's inability to reach GitHub; local formatter and repository checks run separately.
+
+This validates an offline component chain, not the complete live duplex service. Qwen NTP
+planning still uses the reference serializer/planner; H50 cache extraction is evaluated
+separately. The serving config still accepts exported H50/H3 payloads. Camera/microphone
+transport, assistant-ASR feedback with cache invalidation, multi-process stage relay,
+Ulysses generation parity, and production quality acceptance remain open. Do not enable
+this configuration as a quality-approved real-time backend based on these results.

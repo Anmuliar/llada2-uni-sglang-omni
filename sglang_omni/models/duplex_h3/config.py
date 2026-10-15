@@ -23,7 +23,7 @@ class H3DiTStageArgs(FactoryArgs):
     clean_timestep: float = Field(default=0.999, gt=0, le=1)
     capacity_tokens: int = Field(default=16_384, gt=0)
     plan_capacity_tokens: int = Field(default=512, gt=0)
-    denoise_timesteps: tuple[float, ...] = (0.9, 0.5, 0.1)
+    denoise_timesteps: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75)
     max_open_sessions: int = Field(default=2, gt=0)
 
 

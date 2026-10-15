@@ -2,7 +2,9 @@
 
 import json
 import os
+import threading
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
@@ -23,6 +25,10 @@ from sglang_omni.models.duplex_h3.cache import H3KVCache
 from sglang_omni.models.duplex_h3.checkpoint import load_causal_h3
 from sglang_omni.models.duplex_h3.model import CausalH3Model, H3Segment, H3Sequence
 from sglang_omni.models.duplex_h3.sequence import AttentionSpan
+from sglang_omni.models.duplex_h3.streaming import H3SessionHooks
+from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.proto.session import SessionIdentity, TimedChunk
+from sglang_omni.scheduling.session import SessionContext
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
@@ -366,3 +372,87 @@ def test_native_h3_failure_invalidates_session(model: CausalH3Model) -> None:
         hook.remove()
     assert cache.committed_token_count == 0
     assert cache.phase == "idle"
+
+
+@torch.no_grad()
+def test_session_euler_runs_from_noise_to_clean(model: CausalH3Model) -> None:
+
+    generator = torch.Generator(device="cuda:0").manual_seed(715)
+    reference = make_segment(
+        AttentionSpan(kind="reference", token_count=4), 0, 96, generator, 0
+    )
+    shared = make_segment(
+        AttentionSpan(kind="shared", token_count=3),
+        1,
+        model.backbone.arch.text_dim,
+        generator,
+        -1,
+    )
+    plan = make_segment(
+        AttentionSpan(kind="plan", token_count=2, block_index=0),
+        1,
+        model.backbone.arch.text_dim,
+        generator,
+        1,
+    )
+    video = make_segment(
+        AttentionSpan(kind="noisy", token_count=4, block_index=0), 0, 96, generator, 1
+    )
+    audio = make_segment(
+        AttentionSpan(kind="noisy", token_count=2, block_index=0), 2, 32, generator, 1
+    )
+    expected_video = video.tokens.float().clone()
+    expected_audio = audio.tokens.float().clone()
+    for step in range(4):
+        predicted = model(
+            H3Sequence(
+                segments=(
+                    reference,
+                    shared,
+                    plan,
+                    replace(video, tokens=expected_video),
+                    replace(audio, tokens=expected_audio),
+                ),
+                refiner_segments=(shared, plan),
+            ),
+            noisy_timestep=step / 4,
+        )
+        expected_video += predicted.video[-4:].float() / 4
+        expected_audio += predicted.audio[-2:].float() / 4
+    hooks = H3SessionHooks(model, capacity_tokens=32, plan_capacity_tokens=4)
+    identity = SessionIdentity("euler")
+    request = OmniRequest(None)
+    payload = StagePayload(
+        request_id="euler",
+        request=request,
+        data=dict(
+            reference=reference,
+            shared=shared,
+            plan=plan,
+            video=video,
+            audio=audio,
+            block_index=0,
+        ),
+    )
+    hooks.open(identity, request)
+    context = SessionContext(
+        session_identity=identity, cancelled=threading.Event(), emit=lambda chunk: None
+    )
+    try:
+        result = hooks.append(TimedChunk("h3_block", 0, 167, 0, None), payload, context)
+        torch.testing.assert_close(
+            result.data["video_latent"], expected_video, atol=0.01, rtol=0.02
+        )
+        torch.testing.assert_close(
+            result.data["audio_latent"], expected_audio, atol=0.01, rtol=0.02
+        )
+        assert hooks.states[identity].cache.committed_token_count == 13
+    finally:
+        hooks.close(identity)
+    with pytest.raises(ValueError, match="increase"):
+        H3SessionHooks(
+            model,
+            capacity_tokens=32,
+            plan_capacity_tokens=4,
+            denoise_timesteps=(0.75, 0.5, 0.25),
+        )
