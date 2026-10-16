@@ -11,6 +11,7 @@ from transformers import (
     Qwen3VLProcessor,
 )
 from transformers.cache_utils import Cache
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 
 @dataclass(kw_only=True)
@@ -107,17 +108,34 @@ class QwenH50Runner:
 
 
 def load_qwen_h50(
-    model_path: str, adapter_path: str, *, device: str = "cuda:0"
+    model_path: str,
+    adapter_path: str,
+    *,
+    device: str = "cuda:0",
+    tensor_parallel_size: int = 1,
 ) -> tuple[Qwen3VLProcessor, PeftModel]:
     tokenizer = AutoTokenizer.from_pretrained(adapter_path, local_files_only=True)
     processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
     processor.tokenizer = tokenizer
+    if tensor_parallel_size < 1:
+        raise ValueError("Qwen tensor parallel size must be positive")
+    elif tensor_parallel_size > 1:
+        parallel_plan = {
+            f"model.language_model.{name}": style
+            for name, style in Qwen3Config.base_model_tp_plan.items()
+        }
+        device_map = None
+    else:
+        parallel_plan = None
+        device_map = {"": device}
     base = Qwen3VLForConditionalGeneration.from_pretrained(
         model_path,
         dtype=torch.bfloat16,
         local_files_only=True,
         attn_implementation="sdpa",
-        device_map={"": device},
+        device_map=device_map,
+        tp_plan=parallel_plan,
+        tp_size=tensor_parallel_size if parallel_plan is not None else None,
     )
     if base.get_input_embeddings().num_embeddings != len(tokenizer):
         base.resize_token_embeddings(len(tokenizer), mean_resizing=False)
