@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
+    get_sp_group,
     get_ulysses_ctx,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
@@ -77,6 +78,8 @@ class H3Sequence:
 
 @dataclass(frozen=True, kw_only=True)
 class H3Output:
+    """Full modality predictions replicated across Ulysses ranks."""
+
     video: torch.Tensor
     audio: torch.Tensor
 
@@ -106,6 +109,8 @@ def h3_attention(
     if ulysses_size > 1:
         if local_token_count <= 0:
             raise ValueError("Ulysses attention requires nonempty local rows")
+        else:
+            pass
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
         local_head_count = q.shape[1]
         if local_head_count * ulysses_size != attention.num_heads:
@@ -285,16 +290,6 @@ class CausalH3Model(nn.Module):
         hidden_states = hidden_states[row_start:row_stop]
         time_indices = time_indices[row_start:row_stop]
         modality_tags = modality_tags[row_start:row_stop]
-        video_indices = [
-            index - row_start
-            for index in video_indices
-            if row_start <= index < row_stop
-        ]
-        audio_indices = [
-            index - row_start
-            for index in audio_indices
-            if row_start <= index < row_stop
-        ]
         positions = positions[:, row_start:row_stop]
         rope_cache = (
             _rope_cos_sin_cache(backbone.rope(positions), dtype=torch.bfloat16),
@@ -366,6 +361,14 @@ class CausalH3Model(nn.Module):
         video, audio = backbone.final_layer(
             hidden_states, adaln_input=adaln_input, inverse_indices=inverse_indices
         )
+        if ulysses_size > 1:
+            video_width = video.shape[-1]
+            gathered = get_sp_group().all_gather(
+                torch.cat((video, audio), dim=-1), dim=0
+            )
+            video, audio = gathered[:, :video_width], gathered[:, video_width:]
+        else:
+            pass
         output = H3Output(
             video=video[torch.tensor(video_indices, device=device, dtype=torch.long)],
             audio=audio[torch.tensor(audio_indices, device=device, dtype=torch.long)],
