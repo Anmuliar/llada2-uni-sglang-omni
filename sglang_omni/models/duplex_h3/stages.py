@@ -34,6 +34,10 @@ def create_h3_session_executor(
     plan_capacity_tokens: int = 512,
     denoise_timesteps: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75),
     max_open_sessions: int = 2,
+    use_flash_attention: bool = False,
+    flash_num_splits: int = 1,
+    precompute_adaln: bool = False,
+    enable_cuda_graph: bool = False,
     device: str | None = None,
     gpu_id: int | None = None,
 ) -> SessionScheduler:
@@ -44,6 +48,10 @@ def create_h3_session_executor(
         trainables_path=Path(trainables_path),
         clean_timestep=clean_timestep,
         device=concrete_device,
+        use_flash_attention=use_flash_attention,
+        flash_num_splits=flash_num_splits,
+        precompute_adaln=precompute_adaln,
+        enable_cuda_graph=enable_cuda_graph,
     )
     hooks = H3SessionHooks(
         model,

@@ -62,8 +62,8 @@ Each `H3Segment` supplies:
 These are already patchified latents and encoder hidden states, not encoded media files.
 Projections map them to width 5376; the main transformer has 50 layers, 56 attention heads
 and head dimension 128. The adapter preserves native mixed FP32/BF16 operations, role
-embeddings, two text-refiner layers, modality/time AdaLN and output heads. Attention uses
-Torch SDPA with explicit visibility. Physical offsets are never substituted for RoPE
+embeddings, two text-refiner layers, modality/time AdaLN and output heads. The default attention path uses
+Torch SDPA with explicit visibility; the opt-in cached path below uses FlashAttention. Physical offsets are never substituted for RoPE
 coordinates. A production input exporter and padding/batching support are not implemented.
 
 The visibility contract follows the reference mask version `duplex_assistant_av_v5`.
@@ -110,7 +110,7 @@ and replay. There is no unified physical Qwen/DiT pool.
 
 The Ulysses path places sequence-to-head all-to-all after projection/norm/RoPE, then updates
 the cache and runs attention, followed by inverse all-to-all. Each rank retains full history
-for its local heads; the serving boundary still owns output gathering.
+for its local heads; the adapter gathers output rows before selecting the video/audio modalities.
 
 ### Stage 3: Ulysses attention boundary
 
@@ -122,10 +122,9 @@ prefix, plan, and current-media rows. Attention uses the full visibility mask, a
 inverse collective returns `[S_local, H, D]` for the residual and output projections.
 
 The token refiner remains replicated because it is a short text-only computation. The
-returned `H3Output` contains this rank's local row selection; a serving stage must gather
-or decode the local video/audio selections using the same row partition before client
-delivery. Packed lengths must divide evenly by the Ulysses degree. TP and ring parallelism
-are intentionally outside this stage.
+returned `H3Output` contains full video/audio predictions replicated across ranks. The
+adapter pads rows to the Ulysses degree, gathers the final output, and selects valid
+modality rows. TP and ring parallelism remain outside this stage.
 
 The synthetic two-rank smoke check exercises prefix, a one-token plan, and denoise forwards with a
 two-head-per-rank cache, a non-divisible 19-token prefix, and verifies finite local outputs. It is a communication and shape
@@ -328,3 +327,77 @@ separately. The serving config still accepts exported H50/H3 payloads. Camera/mi
 transport, assistant-ASR feedback with cache invalidation, multi-process stage relay,
 Ulysses generation parity, and production quality acceptance remain open. Do not enable
 this configuration as a quality-approved real-time backend based on these results.
+
+## Optional cached-inference acceleration
+
+`H3DiTStageArgs`, `create_h3_session_executor`, and `load_causal_h3` expose the following
+opt-in settings. Defaults retain the original path:
+
+```python
+use_flash_attention=True
+precompute_adaln=True
+enable_cuda_graph=True
+flash_num_splits=4  # L20X SP4 workload; use 1 for the tested SP1 workload
+```
+
+CUDA Graph requires FlashAttention and AdaLN precomputation. `flash_num_splits`
+controls dense KV work partitioning inside the kernel (0 selects the backend heuristic),
+not KV eviction or sparse visibility. Tune it for the query/head/history sizes; a larger
+value is not always faster. The benchmark uses 1 at SP1 and 4 at SP4. The checkpoint must stay immutable after
+inference starts. The adapter reuses SGLang's FlashAttention KV-cache kernel and the
+existing Diffusion fused QK normalization, RoPE, modulation, gate, and MLP kernels.
+This path retains dense attention, BF16 projection weights, all history, the original
+Euler steps, and the separate clean forward. It does not introduce sparse attention,
+FP8 quantization, block skipping, or tensor parallelism.
+
+For plan/media forwards, the physical preallocated storage is:
+
+```text
+plan:   [committed reference/shared/clean AV][current plan][unused capacity]
+media:  [committed reference/shared/clean AV][current AV][current plan][unused capacity]
+```
+
+The current queries see every valid key in these forwards. Permuting current plan and
+media K/V together therefore preserves the mathematical attention operation; keys
+already carry their absolute RoPE coordinates. Reference/shared prefill and the text
+refiner keep their explicit masks and original backend. A GPU int32 valid-length tensor
+excludes unused storage. Indexed writes replace concatenation of the full history on
+every layer and timestep. Cache capacity includes an additional current-plan region;
+only clean AV is committed, and old plan rows are overwritten by subsequent AV.
+`H3KVCache.committed_token_count` owns this optimized path's logical cursor; the native
+Diffusion buffer cursors are only advanced by the original prefill/update path.
+
+Unused K/V storage is zeroed at allocation and session reset. This is necessary for the
+tested FA3 backend: uninitialized NaNs in masked V tiles can contaminate attention even
+when the valid length is correct. Reset invalidates all history; it is not included in
+the per-block steady-state timing and must be budgeted at session admission/close.
+
+AdaLN projections depend on the fixed checkpoint, clean timestep, and sampler timestep.
+Their per-layer parameters are cached once per timestep. Per-token modality and clean/noisy
+selection remain dynamic. The main 50-layer loop, final projection, and Ulysses collectives
+are captured separately for each query layout, current-plan length, and timestep. Refiner,
+input embedding, metadata construction, and session commit remain outside capture.
+
+Each cache allocation owns its captured graphs. Before replay, the adapter updates inputs,
+RoPE values, modality/time indices, KV write offsets, and valid length at stable device
+addresses. Increasing history does not create another graph. Previously unseen query/plan
+shapes do incur capture and warmup cost. One cleared idle cache may be retained by session
+hooks to reuse graphs in a subsequent session; it retains no committed session content.
+
+Call `model.release_cuda_graphs()` before destroying the distributed process group.
+Captured NCCL operations otherwise retain communicator references and can hang teardown.
+Session work must be serialized on the worker's CUDA stream, and a graph's output buffers
+are reused by subsequent calls with the same layout/timestep. Consumers that retain raw
+`H3Output` beyond another replay must clone it; the session Euler path consumes it first.
+
+This is an H3 component optimization. Recorded H50 replay and offline VAE decode do not
+establish live Qwen/H3/VAE overlap or quality acceptance. Long-horizon quality and the
+previous packed-versus-split numerical gap remain separate validation requirements.
+
+On the 2026-10-16 L20X test (320x384, 24 FPS, 90 four-frame blocks, 4 Euler steps,
+recorded H50), median H3-only time across three warm runs changed from 27.233 s to
+9.499 s at SP4; the optimized SP1 control took 10.414 s. Same-kernel eager versus
+Graph outputs were bitwise identical across all 90 blocks at SP1 and SP4, including
+the split=4 SP4 path. Changing the attention backend/split reduction was not bitwise
+equivalent to the original path. Both original and optimized long videos still collapsed;
+these measurements establish performance, not production generation quality.

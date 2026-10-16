@@ -30,6 +30,10 @@ def load_causal_h3(
     trainables_path: Path,
     clean_timestep: float,
     device: torch.device,
+    use_flash_attention: bool = False,
+    flash_num_splits: int = 1,
+    precompute_adaln: bool = False,
+    enable_cuda_graph: bool = False,
 ) -> CausalH3Model:
     source_config = json.loads((transformer_directory / "config.json").read_text())
     if (
@@ -50,7 +54,12 @@ def load_causal_h3(
             pass
     with torch.device("meta"):
         model = CausalH3Model(
-            MiniMaxH3DiTModel(config, hf_config={}), clean_timestep=clean_timestep
+            MiniMaxH3DiTModel(config, hf_config={}),
+            clean_timestep=clean_timestep,
+            use_flash_attention=use_flash_attention,
+            flash_num_splits=flash_num_splits,
+            precompute_adaln=precompute_adaln,
+            enable_cuda_graph=enable_cuda_graph,
         )
     base_state = model.backbone.state_dict()
     if set(index.weight_map) != set(base_state):

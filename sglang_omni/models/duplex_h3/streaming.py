@@ -75,6 +75,8 @@ def cache_for_model(
         head_dimension=architecture.attention_head_dim,
         dtype=torch.bfloat16,
         device=model.backbone.video_patch_proj.weight.device,
+        use_flash_attention=model.use_flash_attention,
+        flash_num_splits=model.flash_num_splits,
     )
 
 
@@ -109,9 +111,10 @@ class H3SessionHooks(SessionHooks):
         self.denoise_timesteps = denoise_timesteps
         self.decoder = decoder
         self.states: dict[SessionIdentity, H3SessionState] = {}
+        self.idle_cache: H3KVCache | None = None
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
-        self.states.pop(session_identity, None)
+        self.close(session_identity)
 
     @torch.inference_mode()
     def append(
@@ -133,14 +136,19 @@ class H3SessionHooks(SessionHooks):
             else:
                 pass
             state = H3SessionState(
-                cache=cache_for_model(
-                    self.model,
-                    capacity_tokens=self.capacity_tokens,
-                    plan_capacity_tokens=self.plan_capacity_tokens,
+                cache=(
+                    self.idle_cache
+                    if self.idle_cache is not None
+                    else cache_for_model(
+                        self.model,
+                        capacity_tokens=self.capacity_tokens,
+                        plan_capacity_tokens=self.plan_capacity_tokens,
+                    )
                 ),
                 reference=reference,
                 shared=shared,
             )
+            self.idle_cache = None
             state.cache.begin_prefix(
                 reference_token_count=reference.span.token_count,
                 shared_token_count=shared.span.token_count,
@@ -325,8 +333,18 @@ class H3SessionHooks(SessionHooks):
             )
         return payload
 
+    @torch.inference_mode()
     def close(self, session_identity: SessionIdentity) -> None:
-        self.states.pop(session_identity, None)
+        state = self.states.pop(session_identity, None)
+        if (
+            state is not None
+            and self.model.enable_cuda_graph
+            and self.idle_cache is None
+        ):
+            state.cache.reset()
+            self.idle_cache = state.cache
+        else:
+            pass
 
     def usage(self, session_identity: SessionIdentity) -> ResourceUsage:
         state = self.states.get(session_identity)

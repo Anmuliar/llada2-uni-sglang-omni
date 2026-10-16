@@ -23,6 +23,8 @@ class H3KVCache:
         head_dimension: int,
         dtype: torch.dtype,
         device: torch.device,
+        use_flash_attention: bool = False,
+        flash_num_splits: int = 1,
     ) -> None:
         if (
             min(
@@ -36,7 +38,12 @@ class H3KVCache:
         ):
             raise ValueError("Cache dimensions and capacities must be positive")
         else:
-            shape = (1, capacity_tokens, local_head_count, head_dimension)
+            self.use_flash_attention: bool = use_flash_attention
+            self.flash_num_splits: int = flash_num_splits
+            storage_tokens = capacity_tokens + (
+                plan_capacity_tokens if use_flash_attention else 0
+            )
+            shape = (1, storage_tokens, local_head_count, head_dimension)
             self.layers: list[CausalSelfAttentionKVCache] = [
                 CausalSelfAttentionKVCache(
                     k=torch.empty(shape, dtype=dtype, device=device),
@@ -49,6 +56,13 @@ class H3KVCache:
                 )
                 for _ in range(layer_count)
             ]
+            # FA3 can touch masked V tiles; padding must not contain NaNs.
+            if use_flash_attention:
+                for layer in self.layers:
+                    layer.k.zero_()
+                    layer.v.zero_()
+            else:
+                pass
             plan_shape = (
                 layer_count,
                 1,
@@ -60,6 +74,15 @@ class H3KVCache:
                 plan_shape, dtype=dtype, device=device
             )
             self.plan_values: torch.Tensor = torch.empty_like(self.plan_keys)
+            self.query_write_indices: torch.Tensor = torch.empty(
+                capacity_tokens, dtype=torch.long, device=device
+            )
+            self.plan_write_indices: torch.Tensor = torch.empty(
+                plan_capacity_tokens, dtype=torch.long, device=device
+            )
+            self.attention_lengths: torch.Tensor = torch.zeros(
+                1, dtype=torch.int32, device=device
+            )
             self.capacity_tokens: int = capacity_tokens
             self.plan_capacity_tokens: int = plan_capacity_tokens
             self.committed_spans: tuple[AttentionSpan, ...] = ()
@@ -141,6 +164,50 @@ class H3KVCache:
                 self.query_spans = (media_span,)
                 self.key_spans = (*self.committed_spans, plan_span, media_span)
             self.phase = phase
+
+    def prepare_flash_attention(self) -> None:
+        query_tokens = sum(span.token_count for span in self.query_spans)
+        self.query_write_indices[:query_tokens].copy_(
+            torch.arange(query_tokens, device=self.query_write_indices.device)
+            + self.committed_token_count
+        )
+        if self.phase == "plan":
+            attention_tokens = self.committed_token_count + query_tokens
+        else:
+            self.plan_write_indices[: self.plan_token_count].copy_(
+                torch.arange(
+                    self.plan_token_count, device=self.plan_write_indices.device
+                )
+                + self.committed_token_count
+                + query_tokens
+            )
+            attention_tokens = (
+                self.committed_token_count + query_tokens + self.plan_token_count
+            )
+        self.attention_lengths.fill_(attention_tokens)
+
+    def write_flash_attention(
+        self, layer_index: int, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer = self.layers[layer_index]
+        query_tokens = key.shape[1]
+        layer.k.index_copy_(1, self.query_write_indices[:query_tokens], key)
+        layer.v.index_copy_(1, self.query_write_indices[:query_tokens], value)
+        if self.phase == "plan":
+            self.plan_keys[layer_index, :, :query_tokens].copy_(key)
+            self.plan_values[layer_index, :, :query_tokens].copy_(value)
+        else:
+            layer.k.index_copy_(
+                1,
+                self.plan_write_indices[: self.plan_token_count],
+                self.plan_keys[layer_index, :, : self.plan_token_count],
+            )
+            layer.v.index_copy_(
+                1,
+                self.plan_write_indices[: self.plan_token_count],
+                self.plan_values[layer_index, :, : self.plan_token_count],
+            )
+        return layer.k, layer.v
 
     def update(
         self, layer_index: int, key: torch.Tensor, value: torch.Tensor
@@ -251,6 +318,11 @@ class H3KVCache:
         """Invalidate all state after cancellation, failure, or changed conditioning."""
         for layer in self.layers:
             layer.reset_indices()
+            if self.use_flash_attention:
+                layer.k.zero_()
+                layer.v.zero_()
+            else:
+                pass
         self.committed_spans = ()
         self.committed_token_count = 0
         self.next_block_index = 0
