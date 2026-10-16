@@ -25,6 +25,10 @@ class H3DiTStageArgs(FactoryArgs):
     plan_capacity_tokens: int = Field(default=512, gt=0)
     denoise_timesteps: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75)
     max_open_sessions: int = Field(default=2, gt=0)
+    use_flash_attention: bool = False
+    flash_num_splits: int = Field(default=1, ge=0)
+    precompute_adaln: bool = False
+    enable_cuda_graph: bool = False
 
 
 class H3DuplexPipelineConfig(PipelineConfig):

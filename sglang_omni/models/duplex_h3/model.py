@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from typing import Literal
+from weakref import WeakKeyDictionary
 
 import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
@@ -87,12 +88,13 @@ class H3Output:
 def h3_attention(
     attention: MiniMaxH3Attention,
     hidden_states: torch.Tensor,
-    visibility: torch.Tensor,
+    visibility: torch.Tensor | None,
     *,
     rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
     cache: H3KVCache | None,
     layer_index: int,
     use_ulysses: bool = True,
+    valid_token_count: int | None = None,
 ) -> torch.Tensor:
     local_token_count = hidden_states.shape[0]
     projected, _ = attention.qkv_proj(hidden_states)
@@ -119,23 +121,40 @@ def h3_attention(
                 f"{local_head_count} * {ulysses_size} != {attention.num_heads}"
             )
         else:
-            valid_token_count = visibility.shape[-2]
+            valid_token_count = (
+                visibility.shape[-2] if visibility is not None else valid_token_count
+            )
+            assert valid_token_count is not None
             q, k, v = (tensor[:valid_token_count] for tensor in (q, k, v))
     else:
         pass
-    if cache is not None:
-        k, v = cache.update(layer_index, k.unsqueeze(0), v.unsqueeze(0))
+    if cache is not None and cache.use_flash_attention and cache.phase != "prefix":
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        k, v = cache.write_flash_attention(layer_index, k.unsqueeze(0), v.unsqueeze(0))
+        attended = flash_attn_with_kvcache(
+            q.unsqueeze(0),
+            k,
+            v,
+            cache_seqlens=cache.attention_lengths,
+            softmax_scale=attention.softmax_scale,
+            causal=False,
+            num_splits=cache.flash_num_splits,
+        ).transpose(1, 2)
     else:
-        k, v = k.unsqueeze(0), v.unsqueeze(0)
-    attended = F.scaled_dot_product_attention(
-        q.unsqueeze(0).transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        attn_mask=visibility,
-        scale=attention.softmax_scale,
-    )
+        if cache is not None:
+            k, v = cache.update(layer_index, k.unsqueeze(0), v.unsqueeze(0))
+        else:
+            k, v = k.unsqueeze(0), v.unsqueeze(0)
+        attended = F.scaled_dot_product_attention(
+            q.unsqueeze(0).transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=visibility,
+            scale=attention.softmax_scale,
+        )
     if ulysses_size > 1:
-        padding_tokens = local_token_count * ulysses_size - visibility.shape[-2]
+        padding_tokens = local_token_count * ulysses_size - valid_token_count
         attended = F.pad(attended.transpose(1, 2), (0, 0, 0, 0, 0, padding_tokens))
         attended = _usp_output_all_to_all(attended, head_dim=2)
         attended = attended.reshape(local_token_count, attention.local_inner_dim)
@@ -147,9 +166,53 @@ def h3_attention(
     return output
 
 
+@dataclass(kw_only=True)
+class H3CapturedForward:
+    graph: torch.cuda.CUDAGraph
+    hidden_states: torch.Tensor
+    rope_values: torch.Tensor
+    rope_positions: torch.Tensor
+    video_indices: torch.Tensor
+    audio_indices: torch.Tensor
+    combined_indices: torch.Tensor
+    inverse_indices: torch.Tensor
+    output: H3Output
+
+
 class CausalH3Model(nn.Module):
-    def __init__(self, backbone: MiniMaxH3DiTModel, *, clean_timestep: float) -> None:
+    def __init__(
+        self,
+        backbone: MiniMaxH3DiTModel,
+        *,
+        clean_timestep: float,
+        use_flash_attention: bool = False,
+        flash_num_splits: int = 1,
+        precompute_adaln: bool = False,
+        enable_cuda_graph: bool = False,
+    ) -> None:
         super().__init__()
+        if flash_num_splits < 0:
+            raise ValueError("FlashAttention split count must be nonnegative")
+        elif enable_cuda_graph and not (use_flash_attention and precompute_adaln):
+            raise ValueError("CUDA Graph requires FlashAttention and precomputed AdaLN")
+        else:
+            pass
+        self.use_flash_attention: bool = use_flash_attention
+        self.flash_num_splits: int = flash_num_splits
+        self.precompute_adaln: bool = precompute_adaln
+        self.enable_cuda_graph: bool = enable_cuda_graph
+        self.timestep_parameters: dict[
+            float, tuple[torch.Tensor, tuple[tuple[torch.Tensor, ...], ...]]
+        ] = {}
+        self.captured_forwards: WeakKeyDictionary[
+            H3KVCache,
+            dict[
+                tuple[int, tuple[int, ...], tuple[int, ...], int, float],
+                H3CapturedForward,
+            ],
+        ] = WeakKeyDictionary()
+        self.graph_capture_count: int = 0
+        self.graph_replay_count: int = 0
         tp_size = get_tp_world_size()
         ulysses_size, _ = get_ulysses_ctx()
         ring_size, _ = get_ring_ctx()
@@ -173,6 +236,11 @@ class CausalH3Model(nn.Module):
                 device=backbone.video_patch_proj.weight.device,
                 dtype=torch.float32,
             )
+
+    def release_cuda_graphs(self) -> None:
+        """Release captured NCCL references before destroying process groups."""
+        torch.cuda.synchronize(self.backbone.video_patch_proj.weight.device)
+        self.captured_forwards.clear()
 
     @torch.no_grad()
     def forward(
@@ -300,14 +368,148 @@ class CausalH3Model(nn.Module):
             inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM
             + torch.tensor(modality_tags, device=device, dtype=torch.long)
         )
-        timesteps = torch.tensor(
-            [self.clean_timestep, noisy_timestep], device=device, dtype=torch.float32
+        if self.precompute_adaln and noisy_timestep in self.timestep_parameters:
+            adaln_input = self.timestep_parameters[noisy_timestep][0]
+        else:
+            timesteps = torch.tensor(
+                [self.clean_timestep, noisy_timestep],
+                device=device,
+                dtype=torch.float32,
+            )
+            assert backbone.time_embedder is not None
+            adaln_input = F.silu(backbone.time_embedder(timesteps)).to(torch.bfloat16)
+            if self.precompute_adaln:
+                self.timestep_parameters[noisy_timestep] = (
+                    adaln_input,
+                    tuple(block.adaln_proj(adaln_input) for block in backbone.blocks),
+                )
+            else:
+                pass
+        visibility = (
+            None
+            if cache is not None
+            and cache.use_flash_attention
+            and cache.phase != "prefix"
+            else attention_mask(
+                spans, spans if cache is None else cache.key_spans, device=device
+            )
         )
-        assert backbone.time_embedder is not None
-        adaln_input = F.silu(backbone.time_embedder(timesteps)).to(torch.bfloat16)
-        visibility = attention_mask(
-            spans, spans if cache is None else cache.key_spans, device=device
-        )
+        video_rows = torch.tensor(video_indices, device=device, dtype=torch.long)
+        audio_rows = torch.tensor(audio_indices, device=device, dtype=torch.long)
+        if cache is not None and cache.use_flash_attention and cache.phase != "prefix":
+            cache.prepare_flash_attention()
+        else:
+            pass
+        if self.enable_cuda_graph and cache is not None and cache.phase != "prefix":
+            graph_key = (
+                total_token_count,
+                tuple(video_indices),
+                tuple(audio_indices),
+                cache.plan_token_count,
+                noisy_timestep,
+            )
+            graphs = self.captured_forwards.setdefault(cache, {})
+            captured = graphs.get(graph_key)
+            if captured is None:
+                graph_hidden = hidden_states.clone()
+                graph_rope = (rope_cache[0].clone(), rope_cache[1])
+                graph_combined = combined_indices.clone()
+                graph_inverse = inverse_indices.clone()
+                capture_stream = torch.cuda.Stream(device=device)
+                capture_stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(capture_stream):
+                    for _ in range(2):
+                        self.run_layers(
+                            graph_hidden,
+                            graph_rope,
+                            graph_combined,
+                            graph_inverse,
+                            adaln_input,
+                            visibility,
+                            cache,
+                            video_rows,
+                            audio_rows,
+                            total_token_count,
+                            noisy_timestep,
+                        )
+                torch.cuda.current_stream(device).wait_stream(capture_stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    graph_output = self.run_layers(
+                        graph_hidden,
+                        graph_rope,
+                        graph_combined,
+                        graph_inverse,
+                        adaln_input,
+                        visibility,
+                        cache,
+                        video_rows,
+                        audio_rows,
+                        total_token_count,
+                        noisy_timestep,
+                    )
+                captured = H3CapturedForward(
+                    graph=graph,
+                    hidden_states=graph_hidden,
+                    rope_values=graph_rope[0],
+                    rope_positions=graph_rope[1],
+                    video_indices=video_rows,
+                    audio_indices=audio_rows,
+                    combined_indices=graph_combined,
+                    inverse_indices=graph_inverse,
+                    output=graph_output,
+                )
+                graphs[graph_key] = captured
+                self.graph_capture_count += 1
+            else:
+                pass
+            captured.hidden_states.copy_(hidden_states)
+            captured.rope_values.copy_(rope_cache[0])
+            captured.combined_indices.copy_(combined_indices)
+            captured.inverse_indices.copy_(inverse_indices)
+            captured.graph.replay()
+            self.graph_replay_count += 1
+            output = captured.output
+        else:
+            output = self.run_layers(
+                hidden_states,
+                rope_cache,
+                combined_indices,
+                inverse_indices,
+                adaln_input,
+                visibility,
+                cache,
+                video_rows,
+                audio_rows,
+                total_token_count,
+                noisy_timestep,
+            )
+        if cache is not None and cache.use_flash_attention and cache.phase != "prefix":
+            cache.next_layer_index = len(backbone.blocks)
+        else:
+            pass
+        if cache is not None:
+            cache.finish_forward()
+        else:
+            pass
+        return output
+
+    def run_layers(
+        self,
+        hidden_states: torch.Tensor,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
+        combined_indices: torch.Tensor,
+        inverse_indices: torch.Tensor,
+        adaln_input: torch.Tensor,
+        visibility: torch.Tensor | None,
+        cache: H3KVCache | None,
+        video_indices: torch.Tensor,
+        audio_indices: torch.Tensor,
+        total_token_count: int,
+        noisy_timestep: float,
+    ) -> H3Output:
+        backbone = self.backbone
+        ulysses_size, _ = get_ulysses_ctx()
         for layer_index, block in enumerate(backbone.blocks):
             assert block.adaln_proj is not None
             (
@@ -317,7 +519,11 @@ class CausalH3Model(nn.Module):
                 shift_mlp,
                 scale_mlp,
                 gate_mlp,
-            ) = block.adaln_proj(adaln_input)
+            ) = (
+                self.timestep_parameters[noisy_timestep][1][layer_index]
+                if self.precompute_adaln
+                else block.adaln_proj(adaln_input)
+            )
             normalized = _modulate_rmsnorm_scale_shift(
                 hidden_states,
                 block.norm1,
@@ -333,6 +539,7 @@ class CausalH3Model(nn.Module):
                 rope_cache=rope_cache,
                 cache=cache,
                 layer_index=layer_index,
+                valid_token_count=total_token_count,
             )
             hidden_states = _modulate_gate(
                 hidden_states,
@@ -370,11 +577,7 @@ class CausalH3Model(nn.Module):
         else:
             pass
         output = H3Output(
-            video=video[torch.tensor(video_indices, device=device, dtype=torch.long)],
-            audio=audio[torch.tensor(audio_indices, device=device, dtype=torch.long)],
+            video=video[video_indices],
+            audio=audio[audio_indices],
         )
-        if cache is not None:
-            cache.finish_forward()
-        else:
-            pass
         return output

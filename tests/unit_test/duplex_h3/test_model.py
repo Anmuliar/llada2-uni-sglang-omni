@@ -23,7 +23,12 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTMod
 
 from sglang_omni.models.duplex_h3.cache import H3KVCache
 from sglang_omni.models.duplex_h3.checkpoint import load_causal_h3
-from sglang_omni.models.duplex_h3.model import CausalH3Model, H3Segment, H3Sequence
+from sglang_omni.models.duplex_h3.model import (
+    CausalH3Model,
+    H3Output,
+    H3Segment,
+    H3Sequence,
+)
 from sglang_omni.models.duplex_h3.sequence import AttentionSpan
 from sglang_omni.models.duplex_h3.streaming import H3SessionHooks
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -456,3 +461,154 @@ def test_session_euler_runs_from_noise_to_clean(model: CausalH3Model) -> None:
             plan_capacity_tokens=4,
             denoise_timesteps=(0.75, 0.5, 0.25),
         )
+
+
+@torch.no_grad()
+def test_flash_graph_growing_history_and_session_reuse(
+    model: CausalH3Model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outputs: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+    original_forward = model.forward
+
+    def reversed_media_forward(
+        sequence: H3Sequence,
+        *,
+        noisy_timestep: float,
+        cache: H3KVCache | None = None,
+    ) -> H3Output:
+        if sequence.segments[0].span.kind in ("clean", "noisy"):
+            sequence = H3Sequence(
+                segments=tuple(reversed(sequence.segments)),
+                refiner_segments=sequence.refiner_segments,
+            )
+        return original_forward(sequence, noisy_timestep=noisy_timestep, cache=cache)
+
+    original_options = (
+        model.use_flash_attention,
+        model.flash_num_splits,
+        model.precompute_adaln,
+        model.enable_cuda_graph,
+    )
+    try:
+        for mode in ("baseline", "flash", "graph"):
+            model.use_flash_attention = mode != "baseline"
+            model.flash_num_splits = 4
+            model.precompute_adaln = mode != "baseline"
+            model.enable_cuda_graph = mode == "graph"
+            hooks = H3SessionHooks(model, capacity_tokens=640, plan_capacity_tokens=8)
+            results: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for session_number in range(2):
+                monkeypatch.setattr(
+                    model,
+                    "forward",
+                    original_forward if session_number == 0 else reversed_media_forward,
+                )
+                generator = torch.Generator(device="cuda:0").manual_seed(
+                    910 + session_number
+                )
+                identity = SessionIdentity(f"{mode}-{session_number}")
+                context = SessionContext(
+                    session_identity=identity,
+                    cancelled=threading.Event(),
+                    emit=lambda chunk: None,
+                )
+                reference = make_segment(
+                    AttentionSpan(kind="reference", token_count=120),
+                    0,
+                    96,
+                    generator,
+                    0,
+                )
+                shared = make_segment(
+                    AttentionSpan(kind="shared", token_count=8),
+                    1,
+                    model.backbone.arch.text_dim,
+                    generator,
+                    -1,
+                )
+                hooks.open(identity, OmniRequest(None))
+                for block_index, plan_tokens in enumerate((1, 2, 1)):
+                    plan = make_segment(
+                        AttentionSpan(
+                            kind="plan",
+                            token_count=plan_tokens,
+                            block_index=block_index,
+                        ),
+                        1,
+                        model.backbone.arch.text_dim,
+                        generator,
+                        block_index + 1,
+                    )
+                    video = make_segment(
+                        AttentionSpan(
+                            kind="noisy", token_count=120, block_index=block_index
+                        ),
+                        0,
+                        96,
+                        generator,
+                        block_index + 1,
+                    )
+                    audio = make_segment(
+                        AttentionSpan(
+                            kind="noisy", token_count=14, block_index=block_index
+                        ),
+                        2,
+                        32,
+                        generator,
+                        block_index + 1,
+                    )
+                    payload = StagePayload(
+                        request_id=f"block-{block_index}",
+                        request=OmniRequest(None),
+                        data=dict(
+                            reference=reference,
+                            shared=shared,
+                            plan=plan,
+                            video=video,
+                            audio=audio,
+                            block_index=block_index,
+                        ),
+                    )
+                    result = hooks.append(
+                        TimedChunk(
+                            "h3_block", block_index * 167, 167, block_index, None
+                        ),
+                        payload,
+                        context,
+                    )
+                    results.append(
+                        (
+                            result.data["video_latent"].clone(),
+                            result.data["audio_latent"].clone(),
+                        )
+                    )
+                    assert (
+                        hooks.states[identity].cache.committed_token_count
+                        == 128 + (block_index + 1) * 134
+                    )
+                hooks.close(identity)
+            outputs[mode] = results
+        for baseline, flash, graph in zip(
+            outputs["baseline"], outputs["flash"], outputs["graph"], strict=True
+        ):
+            for expected, eager, captured in zip(baseline, flash, graph, strict=True):
+                torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+                relative_rmse = (
+                    (
+                        (eager.float() - expected.float()).square().mean()
+                        / expected.float().square().mean()
+                    )
+                    .sqrt()
+                    .item()
+                )
+                assert relative_rmse < 0.02
+        assert model.graph_replay_count > model.graph_capture_count > 0
+    finally:
+        (
+            model.use_flash_attention,
+            model.flash_num_splits,
+            model.precompute_adaln,
+            model.enable_cuda_graph,
+        ) = original_options
+        model.timestep_parameters.clear()
+        model.release_cuda_graphs()
