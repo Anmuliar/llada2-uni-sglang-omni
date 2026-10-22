@@ -401,3 +401,48 @@ Graph outputs were bitwise identical across all 90 blocks at SP1 and SP4, includ
 the split=4 SP4 path. Changing the attention backend/split reduction was not bitwise
 equivalent to the original path. Both original and optimized long videos still collapsed;
 these measurements establish performance, not production generation quality.
+
+### Independent audio/video decode
+
+H3Codecs uses the native Diffusion Video/Audio VAE classes. Its
+`parallel_audio_decode` option submits audio decoding on a dedicated CUDA stream
+while video decoding uses the caller's stream. Input readiness, allocator lifetime
+and the join before CPU output are explicit. Temporal windows, four-frame trimming
+and audio sample counts stay the same. This option is independent of Diffusion's
+distributed video-VAE parallel-decode setting. Audio is submitted before the video
+CPU-output synchronization even when both decoders use the caller's stream.
+
+The `prepare_video_weights` option calls Diffusion's
+`prepare_decoder_autocast_weights` with FP16 once at load, matching this adapter's
+existing autocast precision. Both options are opt-in:
+
+```python
+codecs = H3Codecs(
+    model_path,
+    device="cuda:0",
+    parallel_audio_decode=True,
+    prepare_video_weights=True,
+)
+```
+
+These options affect the four-frame native codec adapter. They do not apply to the
+separate reference-aligned 5-to-17 decoder or the Transformers-based Qwen H50 runner.
+
+A single H20-3e test on 2026-10-22 used 36 generated blocks at 320x384, 24 FPS,
+four frames per block. After a full warmup, the median of three whole-run decode
+times divided by 36 was:
+
+| Configuration | Decode per block |
+| --- | ---: |
+| Original serial | 195.72 ms |
+| Submit audio before video CPU output, same stream | 183.95 ms |
+| Separate audio stream | 171.08 ms |
+| Prepared video weights, same stream | 165.10 ms |
+| Prepared video weights and separate audio stream | 152.47 ms |
+
+All 36 blocks of CPU video frames and audio samples were bitwise identical to the
+original serial outputs in every configuration. The combined configuration reduced
+decode wall time by 22.1%; its last-block trace recorded 23.85 ms of overlapping
+kernels on the video/audio streams. Timing includes CPU media output but excludes
+weight loading, reference encoding, file I/O and MP4 encoding. These are codec-only
+measurements, not connected-service latency or a 5-to-17 decoder benchmark.

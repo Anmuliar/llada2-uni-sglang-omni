@@ -20,7 +20,14 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import (
 
 
 class H3Codecs:
-    def __init__(self, model_path: str, *, device: str = "cuda:0") -> None:
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        device: str = "cuda:0",
+        parallel_audio_decode: bool = False,
+        prepare_video_weights: bool = False,
+    ) -> None:
         root = Path(model_path)
         video_settings = json.loads((root / "FL2VA/video_vae/config.json").read_text())
         audio_settings = json.loads((root / "audio_vae/config.json").read_text())
@@ -51,6 +58,13 @@ class H3Codecs:
         self.video.eval().requires_grad_(False).to(device)
         self.audio.eval().requires_grad_(False).to(device)
         self.device = torch.device(device)
+        self.audio_decode_stream: torch.cuda.Stream | None = (
+            torch.cuda.Stream(device=self.device) if parallel_audio_decode else None
+        )
+        if prepare_video_weights:
+            self.video.prepare_decoder_autocast_weights(torch.float16)
+        else:
+            pass
         self.video_mean = torch.tensor(
             video_settings["latents_mean"], device=device
         ).reshape(1, 24, 1, 1, 1)
@@ -91,21 +105,35 @@ class H3Codecs:
         window = ([reference] + previous[-2:] + [current_video])[-3:]
         video_latents = torch.cat(window, dim=1)[None].to(self.device).float()
         video_latents = video_latents * self.video_std + self.video_mean
+        audio_latents = (
+            current_audio.to(self.device).float() * self.audio_std + self.audio_mean
+        )
+        caller_stream = torch.cuda.current_stream(self.device)
+        audio_stream = self.audio_decode_stream
+        if audio_stream is not None:
+            audio_stream.wait_stream(caller_stream)
+            audio_latents.record_stream(audio_stream)
+        else:
+            audio_stream = caller_stream
         with set_forward_context(0, None), torch.autocast("cuda", dtype=torch.float16):
             pixels = self.video._adaptive_decode(
                 video_latents
             )  # noqa: leading-underscore - Native VAE temporal decoder entry point.
+        try:
+            with torch.cuda.stream(audio_stream), torch.jit.optimized_execution(False):
+                wave = self.audio.decode(audio_latents).squeeze(1).float()
+        finally:
+            if self.audio_decode_stream is not None:
+                caller_stream.wait_stream(audio_stream)
+            else:
+                pass
+        wave.record_stream(caller_stream)
         if pixels.shape[2] != 4 * len(window) or not torch.isfinite(pixels).all():
             raise ValueError("Invalid temporal video decode")
         else:
             pass
         pixels = self.video.processor.revert_tensor(pixels.float())[0, :, -4:]
         frames = (pixels.permute(1, 2, 3, 0) * 255).round().clamp(0, 255).byte().cpu()
-        audio_latents = (
-            current_audio.to(self.device).float() * self.audio_std + self.audio_mean
-        )
-        with torch.jit.optimized_execution(False):
-            wave = self.audio.decode(audio_latents).squeeze(1).float()
         if wave.shape != (2, 5600) or audio_samples not in (5333, 5334):
             raise ValueError("Invalid four-frame audio decode")
         else:
